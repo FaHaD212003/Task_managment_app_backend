@@ -1,0 +1,511 @@
+import axios from "axios";
+import db from "../config/db.js";
+import { sendTaskNotification } from "../utils/sendEmail.js";
+import {
+  createAndDispatchNotifications,
+  getAdminUserIds,
+} from "../utils/notificationHelper.js";
+
+export const getAllTasks = async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.max(1, parseInt(req.query.limit) || 12);
+  const offset = (page - 1) * limit;
+
+  try {
+    const countResult = await db.query("SELECT COUNT(*) FROM tasks");
+    const total = parseInt(countResult.rows[0]?.count || "0", 10);
+
+    const result = await db.query(
+      `SELECT 
+         t.*,
+         u_assignee.username AS assignee_username,
+         u_assignee.email AS assignee_email,
+         u_creator.username AS creator_username,
+         u_creator.email AS creator_email
+       FROM tasks t
+       LEFT JOIN users u_assignee ON t.assignee_id = u_assignee.id
+       LEFT JOIN users u_creator ON t.creator_id = u_creator.id
+       ORDER BY t.created_at DESC NULLS LAST, t.id DESC 
+       LIMIT $1 OFFSET $2`,
+      [limit, offset],
+    );
+
+    res.status(200).json({
+      tasks: result.rows,
+      page,
+      limit,
+      total,
+      hasMore: offset + result.rows.length < total,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch tasks." });
+  }
+};
+
+export const getCalendarTasks = async (req, res) => {
+  const currentUserId = req.user.id;
+  const isAdmin = req.user.role === "admin";
+  const filterUserId = req.query.userId ? parseInt(req.query.userId, 10) : null;
+
+  try {
+    let query = `
+      SELECT 
+        t.*,
+        u_assignee.username AS assignee_username,
+        u_assignee.email AS assignee_email,
+        u_creator.username AS creator_username,
+        u_creator.email AS creator_email
+      FROM tasks t
+      LEFT JOIN users u_assignee ON t.assignee_id = u_assignee.id
+      LEFT JOIN users u_creator ON t.creator_id = u_creator.id
+    `;
+    const params = [];
+
+    if (isAdmin) {
+      if (filterUserId && !isNaN(filterUserId)) {
+        query += " WHERE (t.assignee_id = $1 OR t.creator_id = $1)";
+        params.push(filterUserId);
+      }
+    } else {
+      query += " WHERE (t.assignee_id = $1 OR t.creator_id = $1)";
+      params.push(currentUserId);
+    }
+
+    query += " ORDER BY t.due_date ASC NULLS LAST, t.created_at DESC";
+
+    const result = await db.query(query, params);
+    res.status(200).json(result.rows);
+  } catch (err) {
+    console.error("Error fetching calendar tasks:", err);
+    res.status(500).json({ message: "Failed to fetch calendar tasks." });
+  }
+};
+
+export const getMyTasks = async (req, res) => {
+  const userId = req.user.id;
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.max(1, parseInt(req.query.limit) || 12);
+  const offset = (page - 1) * limit;
+
+  try {
+    const countResult = await db.query(
+      "SELECT COUNT(*) FROM tasks WHERE assignee_id = $1",
+      [userId],
+    );
+    const total = parseInt(countResult.rows[0]?.count || "0", 10);
+
+    const result = await db.query(
+      `SELECT 
+         t.*,
+         u_assignee.username AS assignee_username,
+         u_assignee.email AS assignee_email,
+         u_creator.username AS creator_username,
+         u_creator.email AS creator_email
+       FROM tasks t
+       LEFT JOIN users u_assignee ON t.assignee_id = u_assignee.id
+       LEFT JOIN users u_creator ON t.creator_id = u_creator.id
+       WHERE t.assignee_id = $1 
+       ORDER BY t.created_at DESC NULLS LAST, t.id DESC 
+       LIMIT $2 OFFSET $3`,
+      [userId, limit, offset],
+    );
+
+    res.status(200).json({
+      tasks: result.rows,
+      page,
+      limit,
+      total,
+      hasMore: offset + result.rows.length < total,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch your tasks." });
+  }
+};
+
+export const getAssignedTasks = async (req, res) => {
+  const userId = req.user.id;
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.max(1, parseInt(req.query.limit) || 12);
+  const offset = (page - 1) * limit;
+
+  try {
+    const countResult = await db.query(
+      "SELECT COUNT(*) FROM tasks WHERE creator_id = $1 AND assignee_id IS NOT NULL AND assignee_id <> $1",
+      [userId],
+    );
+    const total = parseInt(countResult.rows[0]?.count || "0", 10);
+
+    const result = await db.query(
+      `SELECT 
+         t.*,
+         u_assignee.username AS assignee_username,
+         u_assignee.email AS assignee_email,
+         u_creator.username AS creator_username,
+         u_creator.email AS creator_email
+       FROM tasks t
+       LEFT JOIN users u_assignee ON t.assignee_id = u_assignee.id
+       LEFT JOIN users u_creator ON t.creator_id = u_creator.id
+       WHERE t.creator_id = $1 AND t.assignee_id IS NOT NULL AND t.assignee_id <> $1 
+       ORDER BY t.created_at DESC NULLS LAST, t.id DESC 
+       LIMIT $2 OFFSET $3`,
+      [userId, limit, offset],
+    );
+
+    res.status(200).json({
+      tasks: result.rows,
+      page,
+      limit,
+      total,
+      hasMore: offset + result.rows.length < total,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch assigned tasks." });
+  }
+};
+
+export const createTask = async (req, res) => {
+  const { title, description, status, assignee_id, due_date } = req.body;
+  const creator_id = req.user.id;
+  const parsedDueDate = due_date ? new Date(due_date).toISOString() : null;
+
+  try {
+    const result = await db.query(
+      "INSERT INTO tasks (title, description, status, assignee_id, creator_id, due_date, due_date_notified, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, FALSE, NOW(), NOW()) RETURNING *",
+      [
+        title,
+        description,
+        status || "pending",
+        assignee_id || null,
+        creator_id,
+        parsedDueDate,
+      ],
+    );
+
+    const createdTask = result.rows[0];
+
+    const fullTaskResult = await db.query(
+      `SELECT 
+         t.*,
+         u_assignee.username AS assignee_username,
+         u_assignee.email AS assignee_email,
+         u_creator.username AS creator_username,
+         u_creator.email AS creator_email
+       FROM tasks t
+       LEFT JOIN users u_assignee ON t.assignee_id = u_assignee.id
+       LEFT JOIN users u_creator ON t.creator_id = u_creator.id
+       WHERE t.id = $1`,
+      [createdTask.id],
+    );
+
+    const newTask = fullTaskResult.rows[0];
+    const io = req.app.get("io");
+
+    // Send Real-Time Notifications to Admins and Assignee
+    const adminIds = await getAdminUserIds();
+    const recipientIds = assignee_id
+      ? [...adminIds, parseInt(assignee_id, 10)]
+      : adminIds;
+
+    const formattedDue = parsedDueDate
+      ? ` Due: ${new Date(parsedDueDate).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`
+      : "";
+
+    await createAndDispatchNotifications(io, {
+      recipientUserIds: recipientIds,
+      taskId: newTask.id,
+      title: "New Task Assigned",
+      message: `Task "${title}" was created.${formattedDue}`,
+      type: "task_assigned",
+    });
+
+    // Send Email Notification if assignee exists
+    if (assignee_id) {
+      const userResult = await db.query(
+        "SELECT email FROM users WHERE id = $1",
+        [assignee_id],
+      );
+      if (userResult.rows.length > 0) {
+        sendTaskNotification(userResult.rows[0].email, title, "assigned");
+      }
+    }
+
+    res.status(201).json(newTask);
+  } catch (err) {
+    console.error("Error creating task:", err);
+    res.status(500).json({ message: "Failed to create task." });
+  }
+};
+
+export const getTaskById = async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const result = await db.query(
+      `SELECT 
+         t.*,
+         u_assignee.username AS assignee_username,
+         u_assignee.email AS assignee_email,
+         u_creator.username AS creator_username,
+         u_creator.email AS creator_email
+       FROM tasks t
+       LEFT JOIN users u_assignee ON t.assignee_id = u_assignee.id
+       LEFT JOIN users u_creator ON t.creator_id = u_creator.id
+       WHERE t.id = $1`,
+      [id],
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "Task not found." });
+    }
+    res.status(200).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch task." });
+  }
+};
+
+export const updateTask = async (req, res) => {
+  const { id } = req.params;
+  const { title, description, status, assignee_id, due_date } = req.body;
+  const parsedDueDate = due_date ? new Date(due_date).toISOString() : null;
+
+  try {
+    const existingResult = await db.query("SELECT * FROM tasks WHERE id = $1", [
+      id,
+    ]);
+    if (existingResult.rows.length === 0) {
+      return res.status(404).json({ message: "Task not found." });
+    }
+    const previousTask = existingResult.rows[0];
+
+    const result = await db.query(
+      `UPDATE tasks 
+       SET title = $1, 
+           description = $2, 
+           status = $3, 
+           assignee_id = $4, 
+           due_date = $5,
+           due_date_notified = CASE WHEN due_date IS DISTINCT FROM $5 THEN FALSE ELSE due_date_notified END,
+           updated_at = NOW() 
+       WHERE id = $6 
+       RETURNING *`,
+      [title, description, status, assignee_id || null, parsedDueDate, id],
+    );
+
+    const updatedTask = result.rows[0];
+
+    const fullTaskResult = await db.query(
+      `SELECT 
+         t.*,
+         u_assignee.username AS assignee_username,
+         u_assignee.email AS assignee_email,
+         u_creator.username AS creator_username,
+         u_creator.email AS creator_email
+       FROM tasks t
+       LEFT JOIN users u_assignee ON t.assignee_id = u_assignee.id
+       LEFT JOIN users u_creator ON t.creator_id = u_creator.id
+       WHERE t.id = $1`,
+      [updatedTask.id],
+    );
+
+    const finalTask = fullTaskResult.rows[0];
+    const io = req.app.get("io");
+
+    // Real-Time Notifications to Admins and Assignees (both previous and new if reassigned)
+    const adminIds = await getAdminUserIds();
+    const recipientIds = [
+      ...adminIds,
+      previousTask.assignee_id,
+      finalTask.assignee_id,
+    ].filter(Boolean);
+
+    const statusLabel = (status || "").replace("_", " ");
+    const formattedDue = parsedDueDate
+      ? ` Due: ${new Date(parsedDueDate).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`
+      : "";
+
+    await createAndDispatchNotifications(io, {
+      recipientUserIds: recipientIds,
+      taskId: finalTask.id,
+      title: "Task Updated",
+      message: `Task "${title}" was updated (Status: ${statusLabel}).${formattedDue}`,
+      type: "task_updated",
+    });
+
+    // Fetch current assignee's email and send email notification
+    if (assignee_id) {
+      const userResult = await db.query(
+        "SELECT email FROM users WHERE id = $1",
+        [assignee_id],
+      );
+      if (userResult.rows.length > 0) {
+        sendTaskNotification(userResult.rows[0].email, title, "updated");
+      }
+    }
+
+    res.status(200).json(finalTask);
+  } catch (err) {
+    console.error("Error updating task:", err);
+    res.status(500).json({ message: "Failed to update task." });
+  }
+};
+
+export const deleteTask = async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await db.query("DELETE FROM tasks WHERE id = $1", [id]);
+    res.status(200).json({ message: "Task deleted successfully." });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to delete task." });
+  }
+};
+
+export const syncGoogleTasks = async (req, res) => {
+  const currentUserId = req.user.id;
+
+  try {
+    const userResult = await db.query(
+      "SELECT google_access_token, google_refresh_token, is_google_user FROM users WHERE id = $1",
+      [currentUserId],
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    let googleToken = userResult.rows[0].google_access_token;
+
+    if (!googleToken) {
+      return res.status(400).json({
+        message:
+          "Google account is not connected. Please verify with Google first.",
+        needAuth: true,
+      });
+    }
+
+    let googleResponse;
+    try {
+      googleResponse = await axios.get(
+        "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks",
+        {
+          headers: {
+            Authorization: `Bearer ${googleToken}`,
+          },
+          params: {
+            showCompleted: true,
+            showHidden: true,
+          },
+        },
+      );
+    } catch (apiErr) {
+      if (
+        apiErr.response?.status === 401 &&
+        userResult.rows[0].google_refresh_token
+      ) {
+        try {
+          const refreshRes = await axios.post(
+            "https://oauth2.googleapis.com/token",
+            {
+              client_id: process.env.GOOGLE_CLIENT_ID,
+              client_secret: process.env.GOOGLE_CLIENT_SECRET,
+              refresh_token: userResult.rows[0].google_refresh_token,
+              grant_type: "refresh_token",
+            },
+          );
+
+          if (refreshRes.data?.access_token) {
+            googleToken = refreshRes.data.access_token;
+            await db.query(
+              "UPDATE users SET google_access_token = $1 WHERE id = $2",
+              [googleToken, currentUserId],
+            );
+
+            googleResponse = await axios.get(
+              "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks",
+              {
+                headers: {
+                  Authorization: `Bearer ${googleToken}`,
+                },
+                params: {
+                  showCompleted: true,
+                  showHidden: true,
+                },
+              },
+            );
+          } else {
+            throw apiErr;
+          }
+        } catch (refreshErr) {
+          return res.status(401).json({
+            message:
+              "Google session expired. Please re-authenticate with Google.",
+            needAuth: true,
+          });
+        }
+      } else {
+        throw apiErr;
+      }
+    }
+
+    const items = googleResponse.data.items || [];
+
+    if (items.length === 0) {
+      return res.status(200).json({
+        message: "No tasks found in your Google Tasks account.",
+        syncedCount: 0,
+      });
+    }
+
+    let insertedCount = 0;
+
+    for (const gTask of items) {
+      if (!gTask.title || gTask.title.trim() === "") continue;
+
+      const title = gTask.title.trim();
+      const description = gTask.notes || "";
+      const status = gTask.status === "completed" ? "completed" : "pending";
+      const dueDate = gTask.due ? new Date(gTask.due).toISOString() : null;
+
+      const existing = await db.query(
+        `SELECT id FROM tasks 
+         WHERE creator_id = $1 AND title = $2`,
+        [currentUserId, title],
+      );
+
+      if (existing.rows.length === 0) {
+        await db.query(
+          `INSERT INTO tasks (title, description, status, due_date, creator_id, assignee_id)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [title, description, status, dueDate, currentUserId, currentUserId],
+        );
+        insertedCount++;
+      } else {
+        await db.query(
+          `UPDATE tasks 
+           SET status = $1, due_date = COALESCE($2, due_date), updated_at = NOW()
+           WHERE id = $3`,
+          [status, dueDate, existing.rows[0].id],
+        );
+      }
+    }
+
+    res.status(200).json({
+      message: `Successfully synchronized ${insertedCount} new tasks from Google Tasks!`,
+      syncedCount: insertedCount,
+      totalGoogleTasks: items.length,
+    });
+  } catch (err) {
+    console.error(
+      "Error syncing Google Tasks:",
+      err.response?.data || err.message,
+    );
+    res.status(500).json({
+      message:
+        err.response?.data?.error?.message ||
+        "Failed to synchronize tasks from Google.",
+    });
+  }
+};
