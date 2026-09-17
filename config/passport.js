@@ -5,6 +5,17 @@ import env from "dotenv";
 
 env.config();
 
+const getCallbackURL = () => {
+  if (process.env.GOOGLE_CALLBACK_URL) {
+    return process.env.GOOGLE_CALLBACK_URL;
+  }
+  let serverUrl = process.env.SERVER_URL || "http://localhost:3000";
+  if (!serverUrl.startsWith("http://") && !serverUrl.startsWith("https://")) {
+    serverUrl = `https://${serverUrl}`;
+  }
+  return `${serverUrl.replace(/\/+$/, "")}/auth/google/home`;
+};
+
 passport.use(
   "google",
   new GoogleStrategy(
@@ -14,6 +25,7 @@ passport.use(
       callbackURL: process.env.SERVER_URL
         ? `${process.env.SERVER_URL}/auth/google/home`
         : "http://localhost:3000/auth/google/home",
+      callbackURL: getCallbackURL(),
       userProfileURL: "https://www.googleapis.com/oauth2/v3/userinfo",
     },
     async (accessToken, refreshToken, profile, cb) => {
